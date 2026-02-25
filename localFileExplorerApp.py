@@ -164,12 +164,14 @@ def html_page(title: str, body: str) -> str:
       gap: 12px;
       grid-template-columns: repeat(auto-fill, minmax(var(--cell), 1fr));
       align-items: start;
+      width: 100%;
     }}
     .card {{
       border: 1px solid #eee;
       border-radius: 14px;
       padding: 10px;
       background: #fff;
+      min-width: 0;
     }}
     .cardwrap {{ position: relative; }}
     .check {{
@@ -271,35 +273,72 @@ def html_page(title: str, body: str) -> str:
   {body}
 
   <script>
-    function toggleAll(checked) {{
-      document.querySelectorAll("input.filecheck").forEach(cb => {{
-        if (!cb.disabled) cb.checked = checked;
-      }});
+  function toggleAll(checked) {{
+    document.querySelectorAll("input.filecheck").forEach(cb => {{
+      if (!cb.disabled) cb.checked = checked;
+    }});
+    updateCount();
+  }}
+
+  function updateCount() {{
+    const n = document.querySelectorAll("input.filecheck:checked").length;
+    const el = document.getElementById("selCount");
+    if (el) el.textContent = n;
+  }}
+
+  function getSelectedFiles() {{
+    return Array.from(document.querySelectorAll("input.filecheck:checked"))
+      .map(cb => cb.value);
+  }}
+
+  async function downloadSelected() {{
+    const files = getSelectedFiles();
+    if (!files.length) {{
+      alert("No files selected");
+      return;
+    }}
+
+    const modeEl = document.getElementById("dlMode");
+    const mode = modeEl ? modeEl.value : "zip";
+
+    if (mode === "zip") {{
+      const form = document.getElementById("selectForm");
+      if (form) form.submit();
+      return;
+    }}
+
+    const token = new URLSearchParams(location.search).get("token") || "";
+    for (let i = 0; i < files.length; i++) {{
+      const rel = files[i];
+      const url = `/download/${{encodeURIComponent(rel)}}?token=${{encodeURIComponent(token)}}`;
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      await new Promise(r => setTimeout(r, 400));
+    }}
+  }}
+
+  // Prevent navigation when clicking checkbox sitting on top of a link/card
+  document.addEventListener("click", (e) => {{
+    const t = e.target;
+    if (t && t.classList && t.classList.contains("filecheck")) {{
+      e.stopPropagation();
       updateCount();
     }}
+  }}, true);
 
-    function updateCount() {{
-      const n = document.querySelectorAll("input.filecheck:checked").length;
-      const el = document.getElementById("selCount");
-      if (el) el.textContent = n;
-    }}
+  document.addEventListener("change", (e) => {{
+    const t = e.target;
+    if (t && t.classList && t.classList.contains("filecheck")) updateCount();
+  }});
 
-    // Prevent navigation when clicking checkbox sitting on top of a link/card
-    document.addEventListener("click", (e) => {{
-      const t = e.target;
-      if (t && t.classList && t.classList.contains("filecheck")) {{
-        e.stopPropagation();
-        updateCount();
-      }}
-    }}, true);
-
-    document.addEventListener("change", (e) => {{
-      const t = e.target;
-      if (t && t.classList && t.classList.contains("filecheck")) updateCount();
-    }});
-
-    document.addEventListener("DOMContentLoaded", updateCount);
-  </script>
+  document.addEventListener("DOMContentLoaded", updateCount);
+</script>
 </body>
 </html>"""
 
@@ -506,9 +545,9 @@ def browse(rel):
         up = ""
 
     # toolbar (view switch)
-    view_buttons = " ".join(
-        f'<a class="btn" href="{view_link(rel_norm, v)}" '
-        f'style="{"font-weight:700" if v == view else ""}">{v}: {VIEW_LABELS[v]}</a>'
+    view_options = "\n".join(
+        f"<option value='{view_link(rel_norm, v)}' {'selected' if v == view else ''}>"
+        f"{v}: {VIEW_LABELS[v]}</option>"
         for v in [1, 2, 3, 4, 5, 6]
     )
 
@@ -516,18 +555,35 @@ def browse(rel):
     <div class="toolbar">
       {up}
       <div class="spacer"></div>
-      {view_buttons}
+    
+      <label class="muted" style="display:flex; align-items:center; gap:8px;">
+        View:
+        <select class="btn" style="padding:8px 10px;" onchange="location.href=this.value">
+          {view_options}
+        </select>
+      </label>
     </div>
     """
 
     zip_action = f"/download-zip?token={quote(ACCESS_TOKEN)}"
     selectbar_open = f"""
-    <form class="selectbar" method="POST" action="{zip_action}">
+    <form class="selectbar" id="selectForm" method="POST" action="{zip_action}">
       <span class="muted">Selected: <b id="selCount">0</b></span>
+    
       <button class="btn" type="button" onclick="toggleAll(true)">Select all</button>
       <button class="btn" type="button" onclick="toggleAll(false)">Clear</button>
-      <button class="btn" type="submit">⬇ Download selected (ZIP)</button>
-      <span class="muted">Tip: select files, then download once.</span>
+    
+      <label class="muted" style="display:flex; align-items:center; gap:8px;">
+        Download option:
+        <select class="btn" id="dlMode" style="padding:8px 10px;">
+          <option value="zip">ZIP (single file)</option>
+          <option value="single" selected>One-by-one</option>
+        </select>
+      </label>
+    
+      <button class="btn" type="button" onclick="downloadSelected()">⬇ Download selected</button>
+    
+      <span class="muted">Tip: browser may ask permission for multiple downloads.</span>
     """
 
     # list directory
@@ -602,7 +658,7 @@ def browse(rel):
                 f"""
                 <div class="card cardwrap">
                   {check}
-                  <a href="{e['link']}">
+                  <a href="{e['link']}" style="display:block">
                     {thumb_html}
                     <div class="name">{'📁 ' if e['kind']=='dir' else ''}{e['name']}</div>
                     <div class="meta">{meta}</div>
