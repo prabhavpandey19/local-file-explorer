@@ -1,17 +1,43 @@
 import os
 import mimetypes
+import hashlib
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
 from flask import Flask, abort, request, send_file, Response
 
 # ----------------------------
+# OPTIONAL: HEIC/HEIF SUPPORT
+# ----------------------------
+# Install:
+#   pip install pillow pillow-heif
+#
+# If pillow-heif isn't installed, HEIC will still be listed, but previews/thumbnails
+# will show a friendly message instead of crashing.
+HEIF_OK = False
+try:
+    from PIL import Image
+    try:
+        import pillow_heif  # noqa: F401
+        pillow_heif.register_heif_opener()
+        HEIF_OK = True
+    except Exception:
+        HEIF_OK = False
+except Exception:
+    Image = None
+    HEIF_OK = False
+
+# ----------------------------
 # CONFIG
 # ----------------------------
 ROOT_DIR = r"D:\Ring ceremony photos"   # <-- change this to the folder you want to share
-HOST = "0.0.0.0"         # use 0.0.0.0 to allow other devices on your LAN
+HOST = "0.0.0.0"
 PORT = 8000
-ACCESS_TOKEN = "pandey-9999" # <-- set a strong token
+ACCESS_TOKEN = "pandey-9999"  # <-- set a strong token
+
+# Thumbnail cache folder (on disk)
+THUMB_CACHE_DIR = Path(".thumb_cache").resolve()
 
 # ----------------------------
 # APP
@@ -19,71 +45,76 @@ ACCESS_TOKEN = "pandey-9999" # <-- set a strong token
 app = Flask(__name__)
 root_path = Path(ROOT_DIR).resolve()
 
-MEDIA_EXTS_IMG = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+# Add HEIC/HEIF extensions
+MEDIA_EXTS_IMG = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
 MEDIA_EXTS_VID = {".mp4", ".webm", ".ogg", ".mov", ".m4v", ".mkv", ".avi"}  # browser support varies
 
-def is_media(p: Path) -> bool:
-    ext = p.suffix.lower()
-    return ext in MEDIA_EXTS_IMG or ext in MEDIA_EXTS_VID or is_image(p) or is_video(p)
+# Help mimetypes recognize heic/heif
+mimetypes.add_type("image/heic", ".heic")
+mimetypes.add_type("image/heif", ".heif")
 
-def get_prev_next(rel_file: str):
-    """
-    Given a file relative path, return (prev_rel, next_rel) among media files in same folder.
-    """
-    rel_norm = rel_file.strip("/").replace("\\", "/")
-    fpath = safe_resolve(rel_norm)
-    folder = fpath.parent
-
-    # collect media files in this folder
-    media_files = []
-    for p in folder.iterdir():
-        if p.is_file() and is_media(p):
-            media_files.append(p)
-
-    # stable ordering
-    media_files.sort(key=lambda x: x.name.lower())
-
-    # find index
-    try:
-        idx = next(i for i, p in enumerate(media_files) if p.resolve() == fpath.resolve())
-    except StopIteration:
-        return None, None
-
-    prev_rel = None
-    next_rel = None
-
-    if idx > 0:
-        prev_rel = str(media_files[idx - 1].relative_to(root_path)).replace("\\", "/")
-    if idx < len(media_files) - 1:
-        next_rel = str(media_files[idx + 1].relative_to(root_path)).replace("\\", "/")
-
-    return prev_rel, next_rel
+# View types requested:
+# 1: Extra Large Icons
+# 2: Large Icons
+# 3: Medium Icons
+# 4: Small Icons
+# 5: List
+# 6: Details
+VIEW_SIZES = {
+    1: 256,
+    2: 160,
+    3: 96,
+    4: 64,
+}
+VIEW_LABELS = {
+    1: "Extra Large Icons",
+    2: "Large Icons",
+    3: "Medium Icons",
+    4: "Small Icons",
+    5: "List",
+    6: "Details",
+}
 
 
 def require_token():
-    # Token via query param ?token=... or header X-Token: ...
     token = request.args.get("token") or request.headers.get("X-Token")
     if ACCESS_TOKEN and token != ACCESS_TOKEN:
         abort(403, "Forbidden: invalid or missing token")
 
+
 def safe_resolve(rel: str) -> Path:
-    """
-    Resolve a user-provided relative path safely within ROOT_DIR
-    (prevents ../ traversal).
-    """
     rel = rel.lstrip("/").replace("\\", "/")
     target = (root_path / rel).resolve()
     if root_path not in target.parents and target != root_path:
         abort(403, "Forbidden: path outside shared root")
     return target
 
+
 def is_video(p: Path) -> bool:
     mt, _ = mimetypes.guess_type(str(p))
     return (mt or "").startswith("video/")
 
+
 def is_image(p: Path) -> bool:
+    # treat heic/heif as image even if mimetypes is weird
+    if p.suffix.lower() in {".heic", ".heif"}:
+        return True
     mt, _ = mimetypes.guess_type(str(p))
     return (mt or "").startswith("image/")
+
+
+def is_media(p: Path) -> bool:
+    ext = p.suffix.lower()
+    return ext in MEDIA_EXTS_IMG or ext in MEDIA_EXTS_VID or is_image(p) or is_video(p)
+
+
+def format_size(num: int) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if num < 1024:
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} PB"
+
 
 def html_page(title: str, body: str) -> str:
     return f"""<!doctype html>
@@ -94,15 +125,103 @@ def html_page(title: str, body: str) -> str:
   <title>{title}</title>
   <style>
     body {{ font-family: system-ui, Arial, sans-serif; margin: 16px; }}
-    a {{ text-decoration: none; }}
+    a {{ text-decoration: none; color: inherit; }}
     .path {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .muted {{ color: #666; }}
+    .btn {{ display:inline-block; padding:8px 12px; border:1px solid #ddd; border-radius:10px; margin-right:8px; }}
+    .toolbar {{ display:flex; flex-wrap: wrap; gap:8px; align-items:center; margin: 12px 0 16px; }}
+    .toolbar .spacer {{ flex: 1; }}
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ padding: 10px; border-bottom: 1px solid #eee; text-align: left; }}
-    .muted {{ color: #666; }}
+
+    /* Icon/Grid view */
+    .grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fill, minmax(var(--cell), 1fr));
+      align-items: start;
+    }}
+    .card {{
+      border: 1px solid #eee;
+      border-radius: 14px;
+      padding: 10px;
+      background: #fff;
+    }}
+    .thumb {{
+      width: 100%;
+      height: var(--thumb);
+      border-radius: 12px;
+      border: 1px solid #eee;
+      overflow: hidden;
+      background: #fafafa;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .thumb img {{
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display:block;
+    }}
+    .name {{
+      margin-top: 8px;
+      font-size: 14px;
+      word-break: break-word;
+      line-height: 1.25;
+    }}
+    .meta {{
+      margin-top: 4px;
+      font-size: 12px;
+      color: #666;
+    }}
+
+    /* List view */
+    .list {{
+      display:flex;
+      flex-direction: column;
+      gap: 6px;
+    }}
+    .list-item {{
+      display:flex;
+      gap: 10px;
+      align-items:center;
+      padding: 8px 10px;
+      border: 1px solid #eee;
+      border-radius: 12px;
+    }}
+    .list-item .mini {{
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      border: 1px solid #eee;
+      overflow:hidden;
+      background:#fafafa;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      flex: 0 0 44px;
+    }}
+    .list-item .mini img {{
+      width:100%;
+      height:100%;
+      object-fit:cover;
+    }}
+    .list-item .title {{
+      font-size: 14px;
+      line-height: 1.25;
+      word-break: break-word;
+    }}
+    .list-item .sub {{
+      font-size: 12px;
+      color: #666;
+      margin-top: 2px;
+    }}
+
+    /* Preview */
     .preview {{ margin-top: 16px; }}
-    img {{ max-width: 100%; height: auto; border: 1px solid #eee; border-radius: 8px; }}
-    video {{ max-width: 100%; border: 1px solid #eee; border-radius: 8px; }}
-    .btn {{ display:inline-block; padding:8px 12px; border:1px solid #ddd; border-radius:10px; }}
+    .preview img {{ max-width: 100%; height: auto; border: 1px solid #eee; border-radius: 8px; }}
+    .preview video {{ max-width: 100%; border: 1px solid #eee; border-radius: 8px; }}
   </style>
 </head>
 <body>
@@ -110,30 +229,125 @@ def html_page(title: str, body: str) -> str:
 </body>
 </html>"""
 
-def format_size(num: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num < 1024:
-            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
-        num /= 1024
-    return f"{num:.1f} PB"
+
+def get_view_type() -> int:
+    try:
+        v = int(request.args.get("view", "6"))
+    except ValueError:
+        v = 6
+    return v if v in VIEW_LABELS else 6
+
+
+def view_link(rel: str, view: int) -> str:
+    rel_q = quote(rel) if rel else ""
+    base = f"/browse/{rel_q}" if rel else "/"
+    return f"{base}?token={quote(ACCESS_TOKEN)}&view={view}"
+
+
+def get_prev_next(rel_file: str):
+    rel_norm = rel_file.strip("/").replace("\\", "/")
+    fpath = safe_resolve(rel_norm)
+    folder = fpath.parent
+
+    media_files = []
+    for p in folder.iterdir():
+        if p.is_file() and is_media(p):
+            media_files.append(p)
+
+    media_files.sort(key=lambda x: x.name.lower())
+
+    try:
+        idx = next(i for i, p in enumerate(media_files) if p.resolve() == fpath.resolve())
+    except StopIteration:
+        return None, None
+
+    prev_rel = None
+    next_rel = None
+    if idx > 0:
+        prev_rel = str(media_files[idx - 1].relative_to(root_path)).replace("\\", "/")
+    if idx < len(media_files) - 1:
+        next_rel = str(media_files[idx + 1].relative_to(root_path)).replace("\\", "/")
+    return prev_rel, next_rel
+
+
+def cache_key_for_thumb(fpath: Path, size: int) -> str:
+    st = fpath.stat()
+    raw = f"{str(fpath.resolve())}|{st.st_mtime_ns}|{st.st_size}|{size}".encode("utf-8", "ignore")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def ensure_thumb_cache_dir():
+    THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def generate_thumb_bytes(fpath: Path, size: int) -> tuple[bytes, str]:
+    """
+    Returns (bytes, mimetype). Generates JPEG thumbnails.
+    """
+    if Image is None:
+        raise RuntimeError("Pillow not installed")
+
+    # HEIC needs pillow-heif
+    if fpath.suffix.lower() in {".heic", ".heif"} and not HEIF_OK:
+        raise RuntimeError("HEIC/HEIF support not installed (pillow-heif)")
+
+    with Image.open(fpath) as im:
+        # Convert to RGB for JPEG
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        else:
+            im = im.convert("RGB")
+        im.thumbnail((size, size))
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=82, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+
 
 @app.route("/")
 def index():
     require_token()
     return browse("")
 
+
 @app.route("/browse/<path:rel>")
 def browse(rel):
     require_token()
-    folder = safe_resolve(rel)
+    view = get_view_type()
 
+    folder = safe_resolve(rel)
     if not folder.exists():
         abort(404, "Not found")
     if folder.is_file():
         return file_view(rel)
 
+    rel_norm = rel.strip("/")
+    title = "Local File Browser"
+
+    # parent link
+    if rel_norm:
+        parent = str(Path(rel_norm).parent).replace("\\", "/")
+        parent_link = view_link(parent if parent != "." else "", view)
+        up = f'<a class="btn" href="{parent_link}">⬅ Up</a>'
+    else:
+        up = ""
+
+    # toolbar (view switch)
+    view_buttons = " ".join(
+        f'<a class="btn" href="{view_link(rel_norm, v)}" '
+        f'style="{"font-weight:700" if v == view else ""}">{v}: {VIEW_LABELS[v]}</a>'
+        for v in [1, 2, 3, 4, 5, 6]
+    )
+
+    toolbar = f"""
+    <div class="toolbar">
+      {up}
+      <div class="spacer"></div>
+      {view_buttons}
+    </div>
+    """
+
     # list directory
-    items = []
+    entries = []
     for p in sorted(folder.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
         try:
             stat = p.stat()
@@ -143,82 +357,178 @@ def browse(rel):
         name = p.name
         rel_child = str(p.relative_to(root_path)).replace("\\", "/")
         url_rel = quote(rel_child)
+        link = f"/browse/{url_rel}?token={quote(ACCESS_TOKEN)}&view={view}"
 
         if p.is_dir():
-            link = f"/browse/{url_rel}?token={quote(ACCESS_TOKEN)}"
-            items.append((f"📁 {name}", link, "Folder", ""))
+            entries.append({
+                "kind": "dir",
+                "name": name,
+                "link": link,
+                "type": "Folder",
+                "size": "",
+                "rel": rel_child,
+                "path": p,
+            })
         else:
-            link = f"/browse/{url_rel}?token={quote(ACCESS_TOKEN)}"
             mt, _ = mimetypes.guess_type(str(p))
             mt = mt or "application/octet-stream"
-            items.append((f"📄 {name}", link, mt, format_size(stat.st_size)))
+            entries.append({
+                "kind": "file",
+                "name": name,
+                "link": link,
+                "type": mt,
+                "size": format_size(stat.st_size),
+                "rel": rel_child,
+                "path": p,
+            })
 
-    # parent link
-    rel_norm = rel.strip("/")
-    if rel_norm:
-        parent = str(Path(rel_norm).parent).replace("\\", "/")
-        parent_link = f"/browse/{quote(parent)}?token={quote(ACCESS_TOKEN)}" if parent != "." else f"/?token={quote(ACCESS_TOKEN)}"
-        up = f'<p><a class="btn" href="{parent_link}">⬅ Up</a></p>'
-    else:
-        up = ""
-
-    rows = "\n".join(
-        f"<tr><td><a href='{link}'>{name}</a></td><td class='muted'>{typ}</td><td class='muted'>{size}</td></tr>"
-        for name, link, typ, size in items
-    )
-
-    body = f"""
-    <h2>Local File Browser</h2>
+    header = f"""
+    <h2>{title}</h2>
     <p class="muted">Root: <span class="path">{root_path}</span></p>
     <p class="muted">Current: <span class="path">/{rel_norm}</span></p>
-    {up}
-    <table>
-      <thead><tr><th>Name</th><th>Type</th><th>Size</th></tr></thead>
-      <tbody>{rows}</tbody>
-    </table>
     """
+
+    # View rendering
+    if view in (1, 2, 3, 4):
+        cell = {1: 260, 2: 190, 3: 140, 4: 120}[view]
+        thumb = VIEW_SIZES[view]
+
+        cards = []
+        for e in entries:
+            if e["kind"] == "dir":
+                thumb_html = f"<div class='thumb' style='height:{thumb}px'>📁</div>"
+                meta = "Folder"
+            else:
+                p = e["path"]
+                if is_image(p) and Image is not None:
+                    tlink = f"/thumb/{quote(e['rel'])}?token={quote(ACCESS_TOKEN)}&s={thumb}"
+                    thumb_html = f"<div class='thumb' style='height:{thumb}px'><img loading='lazy' src='{tlink}' alt='thumb'></div>"
+                elif is_video(p):
+                    thumb_html = f"<div class='thumb' style='height:{thumb}px'>🎞️</div>"
+                else:
+                    thumb_html = f"<div class='thumb' style='height:{thumb}px'>📄</div>"
+                meta = f"{e['type']} • {e['size']}"
+            cards.append(
+                f"""
+                <div class="card">
+                  <a href="{e['link']}">
+                    {thumb_html}
+                    <div class="name">{'📁 ' if e['kind']=='dir' else ''}{e['name']}</div>
+                    <div class="meta">{meta}</div>
+                  </a>
+                </div>
+                """
+            )
+
+        body = f"""
+        {header}
+        {toolbar}
+        <div class="grid" style="--cell:{cell}px; --thumb:{thumb}px;">
+          {''.join(cards)}
+        </div>
+        """
+
+    elif view == 5:
+        # List view
+        items_html = []
+        for e in entries:
+            if e["kind"] == "dir":
+                mini = "<div class='mini'>📁</div>"
+                sub = "Folder"
+            else:
+                p = e["path"]
+                if is_image(p) and Image is not None:
+                    tlink = f"/thumb/{quote(e['rel'])}?token={quote(ACCESS_TOKEN)}&s=64"
+                    mini = f"<div class='mini'><img loading='lazy' src='{tlink}' alt='thumb'></div>"
+                elif is_video(p):
+                    mini = "<div class='mini'>🎞️</div>"
+                else:
+                    mini = "<div class='mini'>📄</div>"
+                sub = f"{e['type']} • {e['size']}"
+            items_html.append(
+                f"""
+                <a class="list-item" href="{e['link']}">
+                  {mini}
+                  <div>
+                    <div class="title">{'📁 ' if e['kind']=='dir' else ''}{e['name']}</div>
+                    <div class="sub">{sub}</div>
+                  </div>
+                </a>
+                """
+            )
+        body = f"""
+        {header}
+        {toolbar}
+        <div class="list">
+          {''.join(items_html)}
+        </div>
+        """
+
+    else:
+        # Details view (your original table style)
+        rows = "\n".join(
+            f"<tr><td><a href='{e['link']}'>{'📁 ' if e['kind']=='dir' else '📄 '}{e['name']}</a></td>"
+            f"<td class='muted'>{e['type']}</td><td class='muted'>{e['size']}</td></tr>"
+            for e in entries
+        )
+        body = f"""
+        {header}
+        {toolbar}
+        <table>
+          <thead><tr><th>Name</th><th>Type</th><th>Size</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+        """
+
     return Response(html_page("Browse", body), mimetype="text/html")
+
 
 def file_view(rel):
     require_token()
+    view = get_view_type()
+
     fpath = safe_resolve(rel)
     if not fpath.exists() or not fpath.is_file():
         abort(404, "Not found")
 
     rel_norm = rel.strip("/").replace("\\", "/")
     parent = str(Path(rel_norm).parent).replace("\\", "/")
-    parent_link = f"/browse/{quote(parent)}?token={quote(ACCESS_TOKEN)}" if parent != "." else f"/?token={quote(ACCESS_TOKEN)}"
+    parent_link = view_link(parent if parent != "." else "", view)
 
     download_link = f"/download/{quote(rel_norm)}?token={quote(ACCESS_TOKEN)}"
     raw_link = f"/raw/{quote(rel_norm)}?token={quote(ACCESS_TOKEN)}"
 
-    # NEXT / PREV among media in same folder
     prev_rel, next_rel = get_prev_next(rel_norm)
-    prev_link = f"/browse/{quote(prev_rel)}?token={quote(ACCESS_TOKEN)}" if prev_rel else None
-    next_link = f"/browse/{quote(next_rel)}?token={quote(ACCESS_TOKEN)}" if next_rel else None
+    prev_link = f"/browse/{quote(prev_rel)}?token={quote(ACCESS_TOKEN)}&view={view}" if prev_rel else None
+    next_link = f"/browse/{quote(next_rel)}?token={quote(ACCESS_TOKEN)}&view={view}" if next_rel else None
 
     nav_buttons = "<div>"
-    if prev_link:
-        nav_buttons += f"<a class='btn' href='{prev_link}'>⬅ Prev</a> "
-    else:
-        nav_buttons += "<span class='muted'>⬅ Prev</span> "
-
-    if next_link:
-        nav_buttons += f"<a class='btn' href='{next_link}'>Next ➡</a>"
-    else:
-        nav_buttons += "<span class='muted'>Next ➡</span>"
+    nav_buttons += f"<a class='btn' href='{prev_link}'>⬅ Prev</a> " if prev_link else "<span class='muted'>⬅ Prev</span> "
+    nav_buttons += f"<a class='btn' href='{next_link}'>Next ➡</a>" if next_link else "<span class='muted'>Next ➡</span>"
     nav_buttons += "</div>"
+
+    size = format_size(fpath.stat().st_size)
+    mt, _ = mimetypes.guess_type(str(fpath))
+    mt = mt or "application/octet-stream"
 
     preview_html = ""
     if is_image(fpath):
-        preview_html = f"""
-        <div class="preview">
-          <h3>Preview (Image)</h3>
-          {nav_buttons}
-          <div style="height:10px"></div>
-          <img src="{raw_link}" alt="image preview" />
-        </div>
-        """
+        if fpath.suffix.lower() in {".heic", ".heif"} and not HEIF_OK:
+            preview_html = """
+            <div class="preview">
+              <h3>Preview (Image)</h3>
+              <p class="muted">HEIC/HEIF preview needs: <span class="path">pip install pillow pillow-heif</span></p>
+            </div>
+            """
+        else:
+            preview_html = f"""
+            <div class="preview">
+              <h3>Preview (Image)</h3>
+              {nav_buttons}
+              <div style="height:10px"></div>
+              <img src="{raw_link}" alt="image preview" />
+            </div>
+            """
     elif is_video(fpath):
         preview_html = f"""
         <div class="preview">
@@ -230,15 +540,11 @@ def file_view(rel):
         </div>
         """
     else:
-        preview_html = f"""
+        preview_html = """
         <div class="preview">
           <p class="muted">No preview available for this file type.</p>
         </div>
         """
-
-    size = format_size(fpath.stat().st_size)
-    mt, _ = mimetypes.guess_type(str(fpath))
-    mt = mt or "application/octet-stream"
 
     body = f"""
     <p><a class="btn" href="{parent_link}">⬅ Back</a></p>
@@ -255,6 +561,54 @@ def file_view(rel):
     """
     return Response(html_page(fpath.name, body), mimetype="text/html")
 
+
+@app.route("/thumb/<path:rel>")
+def thumb(rel):
+    """
+    Thumbnail endpoint used by icon/list views.
+    Generates a JPEG thumbnail (cached on disk).
+    """
+    require_token()
+    fpath = safe_resolve(rel)
+    if not fpath.exists() or not fpath.is_file():
+        abort(404, "Not found")
+
+    if not is_image(fpath):
+        abort(415, "Not an image")
+
+    try:
+        size = int(request.args.get("s", "160"))
+    except ValueError:
+        size = 160
+    size = max(32, min(size, 512))
+
+    ensure_thumb_cache_dir()
+    key = cache_key_for_thumb(fpath, size)
+    cached = THUMB_CACHE_DIR / f"{key}.jpg"
+
+    if cached.exists():
+        return send_file(cached, mimetype="image/jpeg", as_attachment=False)
+
+    # Generate thumbnail
+    try:
+        data, mt = generate_thumb_bytes(fpath, size)
+    except Exception as e:
+        # Fallback: return a tiny SVG placeholder (no pillow/heic support etc.)
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}">
+  <rect width="100%" height="100%" fill="#f3f4f6"/>
+  <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#6b7280"
+        font-family="system-ui, Arial" font-size="{max(10, size//10)}">No thumb</text>
+</svg>"""
+        return Response(svg, mimetype="image/svg+xml")
+
+    try:
+        cached.write_bytes(data)
+    except Exception:
+        pass
+
+    return Response(data, mimetype=mt)
+
+
 @app.route("/download/<path:rel>")
 def download(rel):
     require_token()
@@ -263,14 +617,35 @@ def download(rel):
         abort(404, "Not found")
     return send_file(fpath, as_attachment=True, download_name=fpath.name)
 
+
 @app.route("/raw/<path:rel>")
 def raw(rel):
+    """
+    Raw inline viewing.
+    If HEIC/HEIF and pillow-heif is available, converts to JPEG for browser viewing.
+    Download still returns original via /download.
+    """
     require_token()
     fpath = safe_resolve(rel)
     if not fpath.exists() or not fpath.is_file():
         abort(404, "Not found")
-    # For previews / inline viewing
+
+    ext = fpath.suffix.lower()
+    if ext in {".heic", ".heif"}:
+        if not HEIF_OK or Image is None:
+            abort(415, "HEIC/HEIF preview requires: pip install pillow pillow-heif")
+        # Convert to JPEG on the fly
+        with Image.open(fpath) as im:
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=90, optimize=True)
+            buf.seek(0)
+            # Serve JPEG inline
+            return send_file(buf, mimetype="image/jpeg", as_attachment=False, download_name=fpath.stem + ".jpg")
+
     return send_file(fpath, as_attachment=False)
+
 
 if __name__ == "__main__":
     print(f"Sharing folder: {root_path}")
