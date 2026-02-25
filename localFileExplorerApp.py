@@ -4,6 +4,8 @@ import hashlib
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
+import time
+from typing import Iterable
 
 from flask import Flask, abort, request, send_file, Response
 
@@ -646,8 +648,77 @@ def raw(rel):
 
     return send_file(fpath, as_attachment=False)
 
+def cleanup_thumb_cache_age(max_age_days: int = 1) -> None:
+    """
+    Delete cached thumbnails older than max_age_days (based on file mtime).
+    """
+    if not THUMB_CACHE_DIR.exists():
+        return
+
+    cutoff = time.time() - (max_age_days * 86400)
+
+    for f in THUMB_CACHE_DIR.glob("*.jpg"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            # Ignore files we can't stat/delete
+            pass
+
+
+def enforce_thumb_cache_size_limit(max_mb: int = 500) -> None:
+    """
+    Ensure cache total size <= max_mb by deleting oldest files first until under limit.
+    This trims down to the 500MB target (your "multiple of 500" requirement).
+    """
+    if not THUMB_CACHE_DIR.exists():
+        return
+
+    max_bytes = max_mb * 1024 * 1024
+
+    files = []
+    total = 0
+
+    for f in THUMB_CACHE_DIR.glob("*.jpg"):
+        try:
+            st = f.stat()
+            files.append((f, st.st_mtime, st.st_size))
+            total += st.st_size
+        except OSError:
+            pass
+
+    if total <= max_bytes:
+        return
+
+    # Oldest first
+    files.sort(key=lambda x: x[1])
+
+    # Delete oldest until we're <= max_bytes
+    for f, _mtime, sz in files:
+        if total <= max_bytes:
+            break
+        try:
+            f.unlink()
+            total -= sz
+        except OSError:
+            pass
+
+
+def maintain_thumb_cache(max_age_days: int = 1, max_mb: int = 500) -> None:
+    """
+    Run both policies:
+    1) Delete anything older than 1 day
+    2) Cap cache to 500MB by removing oldest files until <= 500MB
+    """
+    # 1-day cleanup first (quick win)
+    cleanup_thumb_cache_age(max_age_days=max_age_days)
+    # Then enforce size cap
+    enforce_thumb_cache_size_limit(max_mb=max_mb)
 
 if __name__ == "__main__":
+    ensure_thumb_cache_dir()
+    maintain_thumb_cache(max_age_days=1, max_mb=500)
+
     print(f"Sharing folder: {root_path}")
     print(f"Open: http://{HOST}:{PORT}/?token={ACCESS_TOKEN}")
     app.run(host=HOST, port=PORT, debug=False)
