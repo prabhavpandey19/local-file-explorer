@@ -58,23 +58,35 @@ It is designed for **local/LAN use only** (e.g. sharing a folder with phones or 
 
 ---
 
-### 4. Configuration
+### 4. Configuration (.env-based)
 
-Open `localFileExplorerApp.py` and adjust the config section near the top:
+Configuration now comes from environment variables (typically via a `.env` file loaded by `python-dotenv`).
 
-```python
-ROOT_DIR = r"D:\Ring ceremony photos"  # folder you want to share
-HOST = "0.0.0.0"                       # "0.0.0.0" makes it reachable on LAN
-PORT = 8000
-ACCESS_TOKEN = "pandey-9999"           # change to a strong secret
+Create a file named `.env` in the project root (same folder as `localFileExplorerApp.py`) and set:
+
+```env
+# Folder you want to share
+ROOT_DIR=D:\Ring ceremony photos
+
+# Network binding
+HOST=0.0.0.0
+PORT=8000
+
+# Access token used for all requests
+ACCESS_TOKEN=pandey-9999
+
+# Paths to ffmpeg/ffprobe binaries
+FFMPEG_BIN=C:\ffmpeg\bin\ffmpeg.exe
+FFPROBE_BIN=C:\ffmpeg\bin\ffprobe.exe
 ```
 
-- **`ROOT_DIR`**: Set this to the absolute path of the folder you want to expose.
+- **`ROOT_DIR`**: Absolute path of the folder you want to expose.
 - **`HOST`**:
   - Use `"0.0.0.0"` to allow access from other devices on your LAN.
   - Use `"127.0.0.1"` to restrict access to the same machine.
 - **`PORT`**: Any free TCP port, default is `8000`.
 - **`ACCESS_TOKEN`**: Change this to a strong, unique token before sharing with others.
+- **`FFMPEG_BIN` / `FFPROBE_BIN`**: Absolute paths to your `ffmpeg.exe` and `ffprobe.exe` binaries. If not set, the app falls back to `C:\ffmpeg\bin\ffmpeg.exe` and `C:\ffmpeg\bin\ffprobe.exe`.
 
 > **Important:** This app is intended for trusted networks only. Do **not** expose it directly to the public internet without putting it behind proper authentication and HTTPS.
 
@@ -115,7 +127,7 @@ To run this on a different computer:
 3. Follow the same steps:
    - Create and activate a virtualenv.
    - Run `pip install -r requirements.txt`.
-   - Edit `ROOT_DIR` and `ACCESS_TOKEN` in `localFileExplorerApp.py`.
+   - Create a `.env` file on that machine (see section 4) with appropriate `ROOT_DIR`, `ACCESS_TOKEN`, and FFMPEG paths.
    - Run `python localFileExplorerApp.py`.
 4. Visit `http://<machine-ip>:<port>/?token=<your-token>` from a browser on the same network.
 
@@ -161,7 +173,19 @@ git push
 
 ---
 
-### 8. Notes & limitations
+### 8. FFmpeg and media support
+
+- **FFmpeg** is required for **video thumbnails**. Without it, videos can still be downloaded/played by the browser, but thumbnails will not be generated.
+- On **Windows**:
+  - Download a static build of FFmpeg (e.g. from `https://ffmpeg.org` or a trusted distributor).
+  - Extract it to a folder such as `C:\ffmpeg\`.
+  - Point `FFMPEG_BIN` and `FFPROBE_BIN` in your `.env` to the corresponding `ffmpeg.exe` and `ffprobe.exe` paths.
+- On **macOS / Linux**:
+  - Install via your package manager (e.g. `brew install ffmpeg` or `apt install ffmpeg`) or from the official site.
+  - Either put `ffmpeg`/`ffprobe` on `PATH` and update `.env` accordingly, or set the full absolute paths.
+- Optional: install `pillow` and `pillow-heif` if you want HEIC/HEIF image support.
+
+### 9. Notes & limitations
 
 - Designed for **personal / LAN use**, not hardened for internet exposure.
 - Browser support for certain video formats (e.g. `.mkv`, `.avi`) may vary; users can still download those files.
