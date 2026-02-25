@@ -5,10 +5,15 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 import time
-from typing import Iterable
+import subprocess
+import zipfile
+import tempfile
 
-from flask import Flask, abort, request, send_file, Response
+from flask import Flask, abort, request, send_file, Response, after_this_request
+from typing import Optional
 
+FFMPEG_BIN = r"C:\ffmpeg\bin\ffmpeg.exe"
+FFPROBE_BIN = r"C:\ffmpeg\bin\ffprobe.exe"
 # ----------------------------
 # OPTIONAL: HEIC/HEIF SUPPORT
 # ----------------------------
@@ -93,6 +98,9 @@ def safe_resolve(rel: str) -> Path:
 
 
 def is_video(p: Path) -> bool:
+    ext = p.suffix.lower()
+    if ext in MEDIA_EXTS_VID:
+        return True
     mt, _ = mimetypes.guess_type(str(p))
     return (mt or "").startswith("video/")
 
@@ -130,11 +138,25 @@ def html_page(title: str, body: str) -> str:
     a {{ text-decoration: none; color: inherit; }}
     .path {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
     .muted {{ color: #666; }}
-    .btn {{ display:inline-block; padding:8px 12px; border:1px solid #ddd; border-radius:10px; margin-right:8px; }}
-    .toolbar {{ display:flex; flex-wrap: wrap; gap:8px; align-items:center; margin: 12px 0 16px; }}
+    .btn {{ display:inline-block; padding:8px 12px; border:1px solid #ddd; border-radius:10px; margin-right:8px; background:#fff; cursor:pointer; }}
+    .toolbar {{ display:flex; flex-wrap: wrap; gap:8px; align-items:center; margin: 12px 0 10px; }}
     .toolbar .spacer {{ flex: 1; }}
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ padding: 10px; border-bottom: 1px solid #eee; text-align: left; }}
+
+    /* Multi-select bar */
+    .selectbar {{
+      display:flex;
+      gap:8px;
+      align-items:center;
+      flex-wrap: wrap;
+      margin: 8px 0 16px;
+      padding: 10px;
+      border: 1px solid #eee;
+      border-radius: 14px;
+      background: #fafafa;
+    }}
+    .selectbar .muted {{ margin:0; }}
 
     /* Icon/Grid view */
     .grid {{
@@ -149,6 +171,17 @@ def html_page(title: str, body: str) -> str:
       padding: 10px;
       background: #fff;
     }}
+    .cardwrap {{ position: relative; }}
+    .check {{
+      position:absolute;
+      top: 10px;
+      left: 10px;
+      width: 18px;
+      height: 18px;
+      z-index: 2;
+      accent-color: #111;
+    }}
+
     .thumb {{
       width: 100%;
       height: var(--thumb);
@@ -191,6 +224,14 @@ def html_page(title: str, body: str) -> str:
       padding: 8px 10px;
       border: 1px solid #eee;
       border-radius: 12px;
+      background:#fff;
+      position: relative;
+    }}
+    .list-item .check {{
+      position: static;
+      width: 18px;
+      height: 18px;
+      margin-right: 2px;
     }}
     .list-item .mini {{
       width: 44px;
@@ -228,6 +269,37 @@ def html_page(title: str, body: str) -> str:
 </head>
 <body>
   {body}
+
+  <script>
+    function toggleAll(checked) {{
+      document.querySelectorAll("input.filecheck").forEach(cb => {{
+        if (!cb.disabled) cb.checked = checked;
+      }});
+      updateCount();
+    }}
+
+    function updateCount() {{
+      const n = document.querySelectorAll("input.filecheck:checked").length;
+      const el = document.getElementById("selCount");
+      if (el) el.textContent = n;
+    }}
+
+    // Prevent navigation when clicking checkbox sitting on top of a link/card
+    document.addEventListener("click", (e) => {{
+      const t = e.target;
+      if (t && t.classList && t.classList.contains("filecheck")) {{
+        e.stopPropagation();
+        updateCount();
+      }}
+    }}, true);
+
+    document.addEventListener("change", (e) => {{
+      const t = e.target;
+      if (t && t.classList && t.classList.contains("filecheck")) updateCount();
+    }});
+
+    document.addEventListener("DOMContentLoaded", updateCount);
+  </script>
 </body>
 </html>"""
 
@@ -284,7 +356,7 @@ def ensure_thumb_cache_dir():
 
 def generate_thumb_bytes(fpath: Path, size: int) -> tuple[bytes, str]:
     """
-    Returns (bytes, mimetype). Generates JPEG thumbnails.
+    Returns (bytes, mimetype). Generates JPEG thumbnails for images.
     """
     if Image is None:
         raise RuntimeError("Pillow not installed")
@@ -294,7 +366,6 @@ def generate_thumb_bytes(fpath: Path, size: int) -> tuple[bytes, str]:
         raise RuntimeError("HEIC/HEIF support not installed (pillow-heif)")
 
     with Image.open(fpath) as im:
-        # Convert to RGB for JPEG
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
         else:
@@ -304,6 +375,107 @@ def generate_thumb_bytes(fpath: Path, size: int) -> tuple[bytes, str]:
         im.save(buf, format="JPEG", quality=82, optimize=True)
         return buf.getvalue(), "image/jpeg"
 
+
+# ----------------------------
+# VIDEO THUMBNAILS (ffmpeg)
+# ----------------------------
+def ffmpeg_exists() -> bool:
+    try:
+        subprocess.run([FFMPEG_BIN, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return True
+    except Exception:
+        return False
+
+
+def cache_key_for_vthumb(fpath: Path, size: int) -> str:
+    st = fpath.stat()
+    raw = f"VID|{str(fpath.resolve())}|{st.st_mtime_ns}|{st.st_size}|{size}".encode("utf-8", "ignore")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def ffprobe_duration_seconds(fpath: Path) -> Optional[float]:
+    try:
+        p = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(fpath)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        )
+        if p.returncode != 0:
+            return None
+        s = p.stdout.decode("utf-8", "ignore").strip()
+        return float(s) if s else None
+    except Exception:
+        return None
+
+
+def _ffmpeg_grab_frame_jpeg_fastseek(fpath: Path, size: int, seek_seconds: float) -> bytes:
+    vf = f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}"
+    cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", f"{seek_seconds:.3f}",      # FAST seek (may fail for some)
+        "-i", str(fpath),
+        "-frames:v", "1",
+        "-vf", vf,
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "pipe:1",
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError(p.stderr.decode("utf-8", "ignore")[:500])
+    return p.stdout
+
+
+def _ffmpeg_grab_frame_jpeg_slowseek(fpath: Path, size: int, seek_seconds: float) -> bytes:
+    vf = f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}"
+    cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(fpath),
+        "-ss", f"{seek_seconds:.3f}",      # SLOW/accurate seek (more compatible)
+        "-frames:v", "1",
+        "-vf", vf,
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "pipe:1",
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if p.returncode != 0 or not p.stdout:
+        raise RuntimeError(p.stderr.decode("utf-8", "ignore")[:500])
+    return p.stdout
+
+
+def generate_video_thumb_bytes(fpath: Path, size: int) -> tuple[bytes, str]:
+    if not ffmpeg_exists():
+        raise RuntimeError("ffmpeg not installed or not reachable (PATH/FFMPEG_BIN)")
+
+    dur = ffprobe_duration_seconds(fpath)
+
+    # Explorer-ish selection: ~10% in, clamp
+    if dur and dur > 0:
+        t = max(1.0, min(30.0, dur * 0.10))
+        candidates = [t, min(t + 1.0, max(1.0, dur - 0.2)), max(1.0, dur * 0.25)]
+    else:
+        candidates = [1.0, 2.0, 3.0]
+
+    last_err = None
+    for seek in candidates:
+        # Try fast seek first, then fallback
+        try:
+            jpg = _ffmpeg_grab_frame_jpeg_fastseek(fpath, size, seek)
+            return jpg, "image/jpeg"
+        except Exception as e:
+            last_err = e
+        try:
+            jpg = _ffmpeg_grab_frame_jpeg_slowseek(fpath, size, seek)
+            return jpg, "image/jpeg"
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"ffmpeg frame extraction failed: {last_err}")
 
 @app.route("/")
 def index():
@@ -346,6 +518,16 @@ def browse(rel):
       <div class="spacer"></div>
       {view_buttons}
     </div>
+    """
+
+    zip_action = f"/download-zip?token={quote(ACCESS_TOKEN)}"
+    selectbar_open = f"""
+    <form class="selectbar" method="POST" action="{zip_action}">
+      <span class="muted">Selected: <b id="selCount">0</b></span>
+      <button class="btn" type="button" onclick="toggleAll(true)">Select all</button>
+      <button class="btn" type="button" onclick="toggleAll(false)">Clear</button>
+      <button class="btn" type="submit">⬇ Download selected (ZIP)</button>
+      <span class="muted">Tip: select files, then download once.</span>
     """
 
     # list directory
@@ -398,21 +580,28 @@ def browse(rel):
         cards = []
         for e in entries:
             if e["kind"] == "dir":
+                check = ""
                 thumb_html = f"<div class='thumb' style='height:{thumb}px'>📁</div>"
                 meta = "Folder"
             else:
+                check = f"<input class='check filecheck' type='checkbox' name='files' value='{e['rel']}'>"
                 p = e["path"]
+
                 if is_image(p) and Image is not None:
                     tlink = f"/thumb/{quote(e['rel'])}?token={quote(ACCESS_TOKEN)}&s={thumb}"
                     thumb_html = f"<div class='thumb' style='height:{thumb}px'><img loading='lazy' src='{tlink}' alt='thumb'></div>"
                 elif is_video(p):
-                    thumb_html = f"<div class='thumb' style='height:{thumb}px'>🎞️</div>"
+                    vt = f"/vthumb/{quote(e['rel'])}?token={quote(ACCESS_TOKEN)}&s={thumb}"
+                    thumb_html = f"<div class='thumb' style='height:{thumb}px'><img loading='lazy' src='{vt}' alt='video thumb'></div>"
                 else:
                     thumb_html = f"<div class='thumb' style='height:{thumb}px'>📄</div>"
+
                 meta = f"{e['type']} • {e['size']}"
+
             cards.append(
                 f"""
-                <div class="card">
+                <div class="card cardwrap">
+                  {check}
                   <a href="{e['link']}">
                     {thumb_html}
                     <div class="name">{'📁 ' if e['kind']=='dir' else ''}{e['name']}</div>
@@ -425,9 +614,11 @@ def browse(rel):
         body = f"""
         {header}
         {toolbar}
+        {selectbar_open}
         <div class="grid" style="--cell:{cell}px; --thumb:{thumb}px;">
           {''.join(cards)}
         </div>
+        </form>
         """
 
     elif view == 5:
@@ -435,51 +626,79 @@ def browse(rel):
         items_html = []
         for e in entries:
             if e["kind"] == "dir":
+                check = ""
                 mini = "<div class='mini'>📁</div>"
                 sub = "Folder"
             else:
+                check = f"<input class='check filecheck' type='checkbox' name='files' value='{e['rel']}'>"
                 p = e["path"]
                 if is_image(p) and Image is not None:
                     tlink = f"/thumb/{quote(e['rel'])}?token={quote(ACCESS_TOKEN)}&s=64"
                     mini = f"<div class='mini'><img loading='lazy' src='{tlink}' alt='thumb'></div>"
                 elif is_video(p):
-                    mini = "<div class='mini'>🎞️</div>"
+                    vt = f"/vthumb/{quote(e['rel'])}?token={quote(ACCESS_TOKEN)}&s=64"
+                    mini = f"<div class='mini'><img loading='lazy' src='{vt}' alt='video thumb'></div>"
                 else:
                     mini = "<div class='mini'>📄</div>"
                 sub = f"{e['type']} • {e['size']}"
+
             items_html.append(
                 f"""
-                <a class="list-item" href="{e['link']}">
-                  {mini}
-                  <div>
-                    <div class="title">{'📁 ' if e['kind']=='dir' else ''}{e['name']}</div>
-                    <div class="sub">{sub}</div>
-                  </div>
-                </a>
+                <div class="list-item">
+                  {check}
+                  <a style="display:flex; gap:10px; align-items:center; flex:1" href="{e['link']}">
+                    {mini}
+                    <div>
+                      <div class="title">{'📁 ' if e['kind']=='dir' else ''}{e['name']}</div>
+                      <div class="sub">{sub}</div>
+                    </div>
+                  </a>
+                </div>
                 """
             )
+
         body = f"""
         {header}
         {toolbar}
+        {selectbar_open}
         <div class="list">
           {''.join(items_html)}
         </div>
+        </form>
         """
 
     else:
-        # Details view (your original table style)
-        rows = "\n".join(
-            f"<tr><td><a href='{e['link']}'>{'📁 ' if e['kind']=='dir' else '📄 '}{e['name']}</a></td>"
-            f"<td class='muted'>{e['type']}</td><td class='muted'>{e['size']}</td></tr>"
-            for e in entries
-        )
+        # Details view (table)
+        row_parts = []
+        for e in entries:
+            checkbox_html = ""
+            icon = "📁 " if e["kind"] == "dir" else "📄 "
+
+            if e["kind"] != "dir":
+                checkbox_html = (
+                    f"<input class='filecheck' type='checkbox' name='files' value='{e['rel']}'>"
+                )
+
+            row_parts.append(
+                "<tr>"
+                f"<td>{checkbox_html}</td>"
+                f"<td><a href='{e['link']}'>{icon}{e['name']}</a></td>"
+                f"<td class='muted'>{e['type']}</td>"
+                f"<td class='muted'>{e['size']}</td>"
+                "</tr>"
+            )
+
+        rows = "\n".join(row_parts)
+
         body = f"""
         {header}
         {toolbar}
+        {selectbar_open}
         <table>
-          <thead><tr><th>Name</th><th>Type</th><th>Size</th></tr></thead>
+          <thead><tr><th></th><th>Name</th><th>Type</th><th>Size</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
+        </form>
         """
 
     return Response(html_page("Browse", body), mimetype="text/html")
@@ -567,7 +786,7 @@ def file_view(rel):
 @app.route("/thumb/<path:rel>")
 def thumb(rel):
     """
-    Thumbnail endpoint used by icon/list views.
+    Image thumbnail endpoint used by icon/list views.
     Generates a JPEG thumbnail (cached on disk).
     """
     require_token()
@@ -591,11 +810,9 @@ def thumb(rel):
     if cached.exists():
         return send_file(cached, mimetype="image/jpeg", as_attachment=False)
 
-    # Generate thumbnail
     try:
         data, mt = generate_thumb_bytes(fpath, size)
-    except Exception as e:
-        # Fallback: return a tiny SVG placeholder (no pillow/heic support etc.)
+    except Exception:
         svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}">
   <rect width="100%" height="100%" fill="#f3f4f6"/>
   <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#6b7280"
@@ -609,6 +826,99 @@ def thumb(rel):
         pass
 
     return Response(data, mimetype=mt)
+
+
+@app.route("/vthumb/<path:rel>")
+def vthumb(rel):
+    """
+    Video thumbnail endpoint (cached on disk).
+    """
+    require_token()
+    fpath = safe_resolve(rel)
+    if not fpath.exists() or not fpath.is_file():
+        abort(404, "Not found")
+
+    if not is_video(fpath):
+        abort(415, "Not a video")
+
+    try:
+        size = int(request.args.get("s", "160"))
+    except ValueError:
+        size = 160
+    size = max(32, min(size, 512))
+
+    ensure_thumb_cache_dir()
+    key = cache_key_for_vthumb(fpath, size)
+    cached = THUMB_CACHE_DIR / f"{key}.jpg"
+
+    if cached.exists():
+        return send_file(cached, mimetype="image/jpeg", as_attachment=False)
+
+    try:
+        data, mt = generate_video_thumb_bytes(fpath, size)
+    except Exception:
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}">
+  <rect width="100%" height="100%" fill="#f3f4f6"/>
+  <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#6b7280"
+        font-family="system-ui, Arial" font-size="{max(10, size//10)}">No vthumb</text>
+</svg>"""
+        return Response(svg, mimetype="image/svg+xml")
+
+    try:
+        cached.write_bytes(data)
+    except Exception:
+        pass
+
+    return Response(data, mimetype=mt)
+
+
+@app.route("/download-zip", methods=["POST"])
+def download_zip():
+    """
+    Disk-backed ZIP (safe for large selections).
+    Creates the zip on disk (temp file) and deletes it after the response is sent.
+    """
+    require_token()
+
+    rels = request.form.getlist("files")
+    if not rels:
+        abort(400, "No files selected")
+
+    # Create a temp zip file on disk (important for large selections)
+    fd, zip_path = tempfile.mkstemp(prefix="selected_", suffix=".zip")
+    os.close(fd)  # close the OS handle; ZipFile will open it
+
+    try:
+        with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+            for rel in rels:
+                rel_norm = rel.strip("/").replace("\\", "/")
+                fpath = safe_resolve(rel_norm)
+                if not fpath.exists() or not fpath.is_file():
+                    continue
+                z.write(fpath, arcname=rel_norm)
+    except Exception:
+        # Cleanup if zip creation fails
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise
+
+    @after_this_request
+    def _cleanup(response):
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        zip_path,
+        as_attachment=True,
+        download_name="selected_files.zip",
+        mimetype="application/zip",
+        conditional=True,  # lets Flask support range requests on some setups
+    )
 
 
 @app.route("/download/<path:rel>")
@@ -636,17 +946,16 @@ def raw(rel):
     if ext in {".heic", ".heif"}:
         if not HEIF_OK or Image is None:
             abort(415, "HEIC/HEIF preview requires: pip install pillow pillow-heif")
-        # Convert to JPEG on the fly
         with Image.open(fpath) as im:
             if im.mode != "RGB":
                 im = im.convert("RGB")
             buf = BytesIO()
             im.save(buf, format="JPEG", quality=90, optimize=True)
             buf.seek(0)
-            # Serve JPEG inline
             return send_file(buf, mimetype="image/jpeg", as_attachment=False, download_name=fpath.stem + ".jpg")
 
     return send_file(fpath, as_attachment=False)
+
 
 def cleanup_thumb_cache_age(max_age_days: int = 1) -> None:
     """
@@ -662,14 +971,12 @@ def cleanup_thumb_cache_age(max_age_days: int = 1) -> None:
             if f.stat().st_mtime < cutoff:
                 f.unlink()
         except OSError:
-            # Ignore files we can't stat/delete
             pass
 
 
 def enforce_thumb_cache_size_limit(max_mb: int = 500) -> None:
     """
     Ensure cache total size <= max_mb by deleting oldest files first until under limit.
-    This trims down to the 500MB target (your "multiple of 500" requirement).
     """
     if not THUMB_CACHE_DIR.exists():
         return
@@ -690,10 +997,7 @@ def enforce_thumb_cache_size_limit(max_mb: int = 500) -> None:
     if total <= max_bytes:
         return
 
-    # Oldest first
-    files.sort(key=lambda x: x[1])
-
-    # Delete oldest until we're <= max_bytes
+    files.sort(key=lambda x: x[1])  # oldest first
     for f, _mtime, sz in files:
         if total <= max_bytes:
             break
@@ -705,15 +1009,9 @@ def enforce_thumb_cache_size_limit(max_mb: int = 500) -> None:
 
 
 def maintain_thumb_cache(max_age_days: int = 1, max_mb: int = 500) -> None:
-    """
-    Run both policies:
-    1) Delete anything older than 1 day
-    2) Cap cache to 500MB by removing oldest files until <= 500MB
-    """
-    # 1-day cleanup first (quick win)
     cleanup_thumb_cache_age(max_age_days=max_age_days)
-    # Then enforce size cap
     enforce_thumb_cache_size_limit(max_mb=max_mb)
+
 
 if __name__ == "__main__":
     ensure_thumb_cache_dir()
